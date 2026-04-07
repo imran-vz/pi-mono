@@ -2,13 +2,28 @@
  * GitHub Copilot OAuth flow
  */
 
-import { getModels } from "../../models.js";
+import { type Static, Type } from "@sinclair/typebox";
 import type { Api, Model } from "../../types.js";
+import { validateSchema } from "../validation.js";
 import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } from "./types.js";
 
 type CopilotCredentials = OAuthCredentials & {
 	enterpriseUrl?: string;
+	enabledModelIds?: string[];
 };
+
+// Schema for a single model entry in the GitHub Copilot /models API response.
+// additionalProperties: true so extra fields from the API don't cause validation failures.
+const CopilotModelItemSchema = Type.Object({ id: Type.String() }, { additionalProperties: true });
+
+// The API returns either { data: CopilotModelItem[] } (OpenAI list format)
+// or a flat CopilotModelItem[] array. Both are accepted.
+const CopilotModelsResponseSchema = Type.Union([
+	Type.Object({ data: Type.Array(CopilotModelItemSchema) }, { additionalProperties: true }),
+	Type.Array(CopilotModelItemSchema),
+]);
+
+type CopilotModelsResponse = Static<typeof CopilotModelsResponseSchema>;
 
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=");
@@ -273,47 +288,36 @@ export async function refreshGitHubCopilotToken(
 }
 
 /**
- * Enable a model for the user's GitHub Copilot account.
- * This is required for some models (like Claude, Grok) before they can be used.
+ * Fetch the list of model IDs available for the user's GitHub Copilot account.
+ * Returns undefined on any error or if the result is empty.
  */
-async function enableGitHubCopilotModel(token: string, modelId: string, enterpriseDomain?: string): Promise<boolean> {
+export async function fetchGitHubCopilotAvailableModels(
+	token: string,
+	enterpriseDomain?: string,
+): Promise<string[] | undefined> {
 	const baseUrl = getGitHubCopilotBaseUrl(token, enterpriseDomain);
-	const url = `${baseUrl}/models/${modelId}/policy`;
+	const url = `${baseUrl}/models`;
 
 	try {
 		const response = await fetch(url, {
-			method: "POST",
 			headers: {
-				"Content-Type": "application/json",
 				Authorization: `Bearer ${token}`,
 				...COPILOT_HEADERS,
-				"openai-intent": "chat-policy",
-				"x-interaction-type": "chat-policy",
 			},
-			body: JSON.stringify({ state: "enabled" }),
 		});
-		return response.ok;
-	} catch {
-		return false;
-	}
-}
+		if (!response.ok) return undefined;
+		const raw: unknown = await response.json();
 
-/**
- * Enable all known GitHub Copilot models that may require policy acceptance.
- * Called after successful login to ensure all models are available.
- */
-async function enableAllGitHubCopilotModels(
-	token: string,
-	enterpriseDomain?: string,
-	onProgress?: (model: string, success: boolean) => void,
-): Promise<void> {
-	const models = getModels("github-copilot");
-	await Promise.all(
-		models.map(async (model) => {
-			const success = await enableGitHubCopilotModel(token, model.id, enterpriseDomain);
-			onProgress?.(model.id, success);
-		}),
-	);
+		const validated = validateSchema(CopilotModelsResponseSchema, raw);
+		if (!validated) return undefined;
+
+		const items: CopilotModelsResponse = validated;
+		const ids = (Array.isArray(items) ? items : items.data).map((item) => item.id);
+
+		return ids.length > 0 ? ids : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -359,10 +363,10 @@ export async function loginGitHubCopilot(options: {
 	);
 	const credentials = await refreshGitHubCopilotToken(githubAccessToken, enterpriseDomain ?? undefined);
 
-	// Enable all models after successful login
-	options.onProgress?.("Enabling models...");
-	await enableAllGitHubCopilotModels(credentials.access, enterpriseDomain ?? undefined);
-	return credentials;
+	// Fetch available models after successful login
+	options.onProgress?.("Fetching available models...");
+	const fetchedIds = await fetchGitHubCopilotAvailableModels(credentials.access, enterpriseDomain ?? undefined);
+	return { ...credentials, enabledModelIds: fetchedIds };
 }
 
 export const githubCopilotOAuthProvider: OAuthProviderInterface = {
@@ -380,7 +384,13 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 
 	async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 		const creds = credentials as CopilotCredentials;
-		return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
+		const refreshed = await refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
+		// Preserve existing enabledModelIds; fetch once for credentials that pre-date this feature.
+		const enabledModelIds =
+			creds.enabledModelIds !== undefined
+				? creds.enabledModelIds
+				: await fetchGitHubCopilotAvailableModels(refreshed.access, creds.enterpriseUrl);
+		return { ...refreshed, enabledModelIds };
 	},
 
 	getApiKey(credentials: OAuthCredentials): string {
@@ -389,8 +399,14 @@ export const githubCopilotOAuthProvider: OAuthProviderInterface = {
 
 	modifyModels(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] {
 		const creds = credentials as CopilotCredentials;
+		const enabledIds = creds.enabledModelIds;
 		const domain = creds.enterpriseUrl ? (normalizeDomain(creds.enterpriseUrl) ?? undefined) : undefined;
 		const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-		return models.map((m) => (m.provider === "github-copilot" ? { ...m, baseUrl } : m));
+		return models
+			.filter(
+				(m) =>
+					m.provider !== "github-copilot" || !enabledIds || enabledIds.length === 0 || enabledIds.includes(m.id),
+			)
+			.map((m) => (m.provider === "github-copilot" ? { ...m, baseUrl } : m));
 	},
 };
