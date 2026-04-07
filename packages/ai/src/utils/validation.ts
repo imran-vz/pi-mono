@@ -1,3 +1,4 @@
+import type { Static, TSchema } from "@sinclair/typebox";
 import AjvModule from "ajv";
 import addFormatsModule from "ajv-formats";
 
@@ -37,6 +38,21 @@ if (canUseRuntimeCodegen()) {
 	} catch (_e) {
 		console.warn("AJV validation disabled due to CSP restrictions");
 	}
+}
+
+/**
+ * Validate data against a TypeBox schema using the shared AJV instance.
+ * Returns the typed value on success, or undefined if validation fails.
+ * When AJV is unavailable (CSP-restricted environments), skips validation
+ * and returns the data as-is, matching the behaviour of validateToolArguments.
+ */
+export function validateSchema<T extends TSchema>(schema: T, data: unknown): Static<T> | undefined {
+	if (!ajv || !canUseRuntimeCodegen()) {
+		// Skip validation — trust the data in environments without runtime code generation
+		return data as Static<T>;
+	}
+	const validate = ajv.compile(schema);
+	return validate(data) ? (data as Static<T>) : undefined;
 }
 
 /**
